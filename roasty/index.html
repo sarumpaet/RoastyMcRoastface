@@ -1,0 +1,309 @@
+   <!DOCTYPE html><html>
+      <head>
+        <title>Roasty McRoastface</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          html { font-family: sans-serif; text-align: center; }
+          body { display: inline-flex; flex-direction: column; }
+          h1 { margin-bottom: 1.2em; } 
+          h2 { margin: 0; }
+          XXXdiv { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; grid-auto-flow: column; grid-gap: 1em; }
+          .btn { background-color: #5B5; border: none; color: #fff; padding: 0.5em 1em;
+                 font-size: 2em; text-decoration: none }
+          .btn.ON { background-color: #333; }
+        </style>
+      </head>
+
+           
+      <body>
+        <h1>Roasty McRoastface</h1>
+
+        <div>
+          <h2>Temperature: <span id="myTemp"></span></h2>
+          <br/>
+          <a class="btn" id="btn1" onclick="setState(RoastyState.Preheating)">Preheat</a>
+          <a class="btn" id="btn2" onclick="setState(RoastyState.Running)">Start</a>
+          <a class="btn" id="btn3" onclick="setState(RoastyState.Paused)">Pause</a>
+          <a class="btn" id="btn0" onclick="setState(RoastyState.Stopped)">Stop</a>
+          <a class="btn" id="btn4">Cooldown</a>
+          <br/>&nbsp;
+        </div>
+
+        <div><canvas id="myChart" width="800px" height="800px"></canvas></div>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+        <div><textarea id="myProgram" cols="50" rows="20"></textarea></div>
+        <div><br/><a class="btn" onclick="activateProgram()">Load program</a></div>
+
+        <br/>&nbsp;<br/>&nbsp;
+        <div><a href="https://en.wikipedia.org/wiki/Coffee_roasting#Roasts" target="_blank">Roasts</a><br/>
+             Drying 165°C<br/>
+             Cinnamon Roast 196°C, during 1st crack, about 10 mins<br/>
+             City/Light Roast 205-220°C, end of 1st crack<br/>
+             City+ Roast 207-225°C, a bit after 1st crack, no oil on beans<br/>
+             Full City Roast 210-230°C, just before 2nd crack, tiny bit of oil on beans<br/>
+             Full City+ Roast 218-235°C, beginning of 2nd crack, flecks of oil on beans<br/>
+             Vienna Roast 221-240°C, mid 2nd crack, oily beans, beans still brown<br/>
+             French Roast 227-245°C, end of 2nd crack, burnt sugars, smoke, beans going black<br/>
+             Italian/Spanish Roast 235-250°C, lots of smoke</div>
+
+        <br/>&nbsp;
+        <div><img id="tasmota_req" src=""></img></div>
+
+<script>
+const testing = false;
+const servo_dir = 1;
+let servo_min = 0;
+let servo_max = 50;
+let servo_preheat = 0;
+let phase1_time = 120;
+let servo_wobble = true;
+const controllerPars = {"k_p": 2.5, "k_i": 0.2, "k_d": 0.1, "i_max": 25, "corr_max": 10};
+const timedelta = 1000; //milliseconds
+//const server = "http://127.0.0.1:9080";  // Wokwi gateway
+const server = "";  // hosted on ESP
+const tasmota_heating_off = "http://192.168.0.xx/cm?cmnd=Power%20Off"
+
+// simplified/modified https://github.com/Philmod/node-pid-controller
+class Controller {
+  constructor(pars) {
+    this.k_p = pars.k_p || 0;
+    this.k_i = pars.k_i || 0;
+    this.k_d = pars.k_d || 0;
+    this.i_max = pars.i_max || 0;
+    this.corr_max = pars.corr_max || 0;
+    this.sumError  = 0;
+    this.lastError = 0;
+  }
+
+  update(target, currentValue, dt) {
+    let error = (target - currentValue);
+    this.sumError = this.sumError + error*dt;
+    if (this.i_max > 0 && Math.abs(this.sumError) > this.i_max) {
+      this.sumError = Math.sign(this.sumError) * this.i_max;
+    }
+    let dError = (error - this.lastError)/dt;
+    this.lastError = error;
+    let corr = (this.k_p*error) + (this.k_i * this.sumError) + (this.k_d * dError);
+    if(Math.abs(corr) > this.corr_max) corr = Math.sign(corr) * this.corr_max;
+    return corr;
+  }
+
+  reset() {
+    this.sumError  = 0;
+    this.lastError = 0;
+  }
+}
+
+const controller = new Controller(controllerPars);
+
+const data = {
+  datasets: [
+    {
+      label: 'Target',
+      showLine: true,
+      data: [],
+      borderColor: 'rgb(99, 255, 132)',
+      yAxisID: 'y'
+    },
+    {
+      label: 'Actual',
+      showLine: true,
+      data: [],
+      borderColor: 'rgb(255, 99, 132)',
+      yAxisID: 'y'
+    },
+    {
+      label: 'Control',
+      showLine: true,
+      data: [],
+      borderColor: 'rgb(190, 190, 190)',
+      yAxisID: 'y1'
+    }
+  ]
+};
+
+const config = {
+  type: 'scatter',
+  data: data,
+  options: {
+    animation: { duration: 0 },
+    scales: {
+      x: {
+        type: 'linear',
+        position: 'bottom',
+        ticks: { callback: (val, index) => `${Math.floor(val/60)}:${String(Math.floor(val)%60).padStart(2,'0')}` }
+      },
+      y: {
+        type: 'linear',
+        position: 'left',
+        display: 'true',
+        min: 110
+      },
+      y1: {
+        type: 'linear',
+        position: 'right',
+        display: 'true',
+        grid: { drawOnChartArea: false }
+      }
+    }
+  }
+};
+
+  const RoastyState = { Stopped: 0, Preheating: 1, Running: 2, Paused: 3, Finished: 4 }; // aligned with btnX buttons
+  const chart = new Chart(document.getElementById('myChart'), config);
+  let state = RoastyState.Stopped;
+  let starttime = -1;
+  let timebase = 0;
+  let simtemp = 150;
+
+  async function loopFunc() {
+    try {
+      let newtemp = 0;
+      let deltat = 0;
+      if(testing) {
+        newtemp = simtemp;
+        timebase += timedelta;
+        deltat = timedelta;
+      } else {
+        const response = await fetch(`${server}/status`);
+        json = await response.json();
+        let x = json.adc / 10;
+        // wolfram alpha: InterpolatingPolynomial[{{409.5,40}, {350, 65}, {245.2,105}, {121.0, 150}, {43.5, 200}, {12.5, 250}}, x]
+        newtemp = 279.437 - 2.61701 * x + 0.0221962 * x*x - 0.000101395 * x*x*x + 2.1653153959361429e-7 * x*x*x*x - 1.7507292908447019e-10 * x*x*x*x*x;
+        if(newtemp<40) newtemp=40;
+        deltat = json.time - timebase;
+        timebase = json.time;
+      }
+      document.getElementById("myTemp").innerHTML = newtemp.toFixed(1);
+
+      if(starttime<0 && state==RoastyState.Running) starttime = timebase;
+
+      let targetTemp = 0;
+      let elapsedtime = timebase - starttime;
+
+      if(state==RoastyState.Running) {
+        // log temperature to chart
+        let data = chart.config.data.datasets[1].data;
+        let newpoint = {x: elapsedtime/1000, y: newtemp};
+        data.push(newpoint);
+        targetTemp = getTarget(elapsedtime/1000);
+        if(targetTemp === null) setState(RoastyState.Finished);
+      } else if(state==RoastyState.Preheating) {
+        targetTemp = 1; // dummy
+      } else if(state==RoastyState.Paused) {
+        //TODO keep temp, pause elapsedtime
+      } else {
+        targetTemp = 0;
+      }
+      if(state==RoastyState.Finished) {
+        targetTemp = 0;
+        document.getElementById("tasmota_req").src = tasmota_heating_off + "&rnd235162=" + Math.floor(Math.random() * 100000);
+      } else {
+        document.getElementById("tasmota_req").src = "";
+      }
+
+      // update servo
+      let control = controller.update(targetTemp, newtemp, deltat/1000);
+      // servo: 0-cool/high fan, 200-hot/low fan
+      // control: -10 .. +10
+      let servo = Math.floor(servo_dir*control*10 + 100);
+      if(state==RoastyState.Preheating) servo = servo_preheat;
+      if(state==RoastyState.Running) {
+        if(elapsedtime<(phase1_time*1000)) {
+          let perc = phase1_time*1000/elapsedtime;
+          servo = servo_preheat*(1-perc) + servo*perc;
+        }
+        if(targetTemp<=195) {
+          if(servo_wobble && ((Math.floor(elapsedtime/1000))%4)==0) servo = servo_dir > 0 ? servo_min : servo_max;
+        }
+      }
+      if(isNaN(servo)) servo = servo_dir > 0 ? servo_min : servo_max;
+      if(servo < servo_min) servo = servo_min;
+      if(servo > servo_max) servo = servo_max;
+      console.log(`Servo: ${servo}, error: ${controller.lastError.toFixed(2)}, sumError: ${controller.sumError.toFixed(2)}`);
+      if(!testing) await fetch(`${server}/servo/${servo}`);
+
+      if(state==RoastyState.Running) {
+        // log servo control to chart
+        let data = chart.config.data.datasets[2].data;
+        newpoint = {x: elapsedtime/1000, y: servo};
+        data.push(newpoint);
+      }
+
+      chart.update();
+      if(testing) {
+        simtemp += (control||0)/1.2;
+        simtemp -= 2;
+      }
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  setInterval(loopFunc, timedelta);
+
+  function getTarget(time) {
+    let data = chart.config.data.datasets[0].data;
+    let i = 0;
+    while((i < data.length) && (data[i].x <= time)) i++;
+    if(i < data.length && i > 0) {
+      let prevx = data[i-1].x;
+      let nextx = data[i].x;
+      let prevy = data[i-1].y;
+      let nexty = data[i].y;
+      let deltax = nextx - prevx;
+      let perc = (time - prevx) / deltax;
+      return perc * nexty + (1 - perc) * prevy;
+    }
+    return null;
+  }
+
+  function reset() {
+    chart.config.data.datasets[1].data = [{x:0,y:0}];
+    chart.config.data.datasets[2].data = [{x:0,y:0}];
+    chart.update();
+    controller.reset();
+    elapsedtime = 0;
+    starttime = -1;
+  }
+
+  function loadProgram(myProgram) {
+    document.getElementById("myProgram").value = myProgram;
+    let lines = myProgram.split("\n");
+    let time = 0;
+    let data = [];
+    for(let line of lines) {
+      line = line.trim();
+      if(line.startsWith("#") || line === "") continue;
+      let [delay, target] = line.split(",");
+      time = time + parseInt(delay);
+      let newpoint = {x: time, y: parseInt(target)};
+      data.push(newpoint);
+    }
+    chart.config.data.datasets[0].data = data;
+    reset();
+  }
+
+  function activateProgram() {
+    let program = document.getElementById("myProgram").value;
+    window.localStorage.setItem("myProgram", program);
+    loadProgram(program);
+  }
+
+  function setState(_state) {
+    if(_state==RoastyState.Running && state in [RoastyState.Stopped, RoastyState.Preheating]) reset();
+    let button = document.getElementById(`btn${state}`);
+    if(button) button.classList.remove("ON");
+    state = _state;
+    button = document.getElementById(`btn${state}`);
+    if(button) button.classList.add("ON");
+  }
+
+  let prog = window.localStorage.getItem("myProgram");
+  if(prog === null) prog = "# durationInSecs_integer, temperature_integer\n0,120\n240,180\n400,234\n240,234";
+  loadProgram(prog);
+</script>
+
+      </body>
+    </html>
